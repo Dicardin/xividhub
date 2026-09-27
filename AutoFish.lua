@@ -46,6 +46,11 @@ local ContentProvider   = game:GetService("ContentProvider")
 
 local LocalPlayer = Players.LocalPlayer
 
+-- where the script keeps its files; declared up here because the island spots
+-- and the settings both live in this folder
+local CFG_FOLDER = "AutoFish"
+local CFG_FILE   = "autofish.cfg.json"
+
 --------------------------------------------------------------------------------
 --  ACCESS KEY
 --------------------------------------------------------------------------------
@@ -95,6 +100,9 @@ local Config = {
 	SellEvery = 45,      -- auto sell every N seconds (0 = off)
 	Bait      = "Keep current",
 	AutoBait  = true,
+
+	-- travel
+	TpFloat   = true,    -- hold the character on the surface in open water (no drowning)
 
 	-- look & feel
 	Accent    = "Cyan",  -- neon accent colour (see ACCENTS)
@@ -161,6 +169,8 @@ local S = {
 	status     = "Locked",
 	note       = "",
 	notify     = nil,
+	home       = nil,   -- where the character stood when the script booted
+	floatTop   = 0,     -- surface height of the last water destination, 0 = off
 
 	-- access key
 	unlocked   = false,
@@ -982,6 +992,398 @@ local function baitStep()
 end
 
 --------------------------------------------------------------------------------
+--  ISLAND TELEPORTS
+--------------------------------------------------------------------------------
+--  Every fast-travel door in Fisch is shut for scripts. RE/FastTravel/Teleport,
+--  RF/RequestTeleportCFrame and RF/ElevatorPrompt/RequestTeleport all answer
+--  without a word and leave the character exactly where it was, so the tab does
+--  the one thing that does work: a plain client-side PivotTo.
+--
+--  The coordinates are not guesses. Every spot below is the middle of a real
+--  fishing volume the game itself uses - the parts inside workspace/zones/
+--  fishing, which mark where each island's fish actually are. They were read
+--  out of the running game, so a cast from that point lands in the right water.
+--
+--  Two things are measured for every place below, and the second one is the one
+--  the character is actually put down on:
+--
+--    x, y, z   - the middle of the real fishing volume, taken from
+--                workspace/zones/fishing, so the description is honest about
+--                what is going to be fished
+--    sx, sy, sz - solid ground to stand on. Found by walking the character over
+--                the region, waiting for the island to stream in and shooting a
+--                ray down, then keeping only hits that are flat, above the water
+--                and have room for a head. Or, where no shore is in casting
+--                range, wy - the height the sea surface was measured at.
+--
+--  That second number exists because the sea is not at one height in Fisch. It
+--  sits at y = 102 off Moosewood and at y = 153 over the Grand Reef, so putting
+--  the character on a guessed "sea level" drops them under the surface in half
+--  the map, and the oxygen runs out while the bot is still casting. Standing on
+--  measured ground has no such guess in it.
+--
+--  Three sources are tried in order:
+--    1. the table below - measured on foot, exact
+--    2. the spots file - anywhere the user has already been, kept on disk
+--    3. a live lookup - the island's spawn folder, its quest folder or its
+--       loaded geometry, which covers the places that are in neither
+--
+--  Two places are marked mode = "shore" but still sit far from their volume:
+--  Mineshaft and Keepers Altar. The water above them is not survivable, so
+--  they land on the closest ground that is.
+--
+--  The spots live in their own file and not in the settings: Roblox JSONEncode
+--  refuses dictionary tables, and a table keyed by island name is exactly that.
+--  The file stores plain rows instead, which encode without trouble.
+--------------------------------------------------------------------------------
+
+local WATER_Y = 126  -- rough sea level, only a last-resort guess
+
+--  mode = "shore": stand on sx, sy, sz.  mode = "water": float on the surface.
+local ISLANDS = {
+	{ name = "Moosewood",        zone = "Moosewood Ocean", x = 489,  y = 98,  z = 178,
+	  mode = "shore", sx = 509,   sy = 172, sz = 178  },
+	{ name = "Roslit Bay",        zone = "Roslit Bay",      x = -1521, y = 100, z = 518,
+	  mode = "shore", sx = -1461, sy = 135, sz = 622  },
+	{ name = "Roslit Pond",       zone = "Roslit Pond",     x = -1761, y = 134, z = 596,
+	  mode = "shore", sx = -1751, sy = 129, sz = 613  },
+	{ name = "Mushgrove",         zone = "Mushgrove Water", x = 2525, y = 119, z = -776,
+	  mode = "shore", sx = 2525,  sy = 130, sz = -756 },
+	{ name = "Sunstone Island",   zone = "Sunstone",        x = -846, y = 111, z = -1222,
+	  mode = "shore", sx = -856,  sy = 130, sz = -1205 },
+	{ name = "Terrapin Island",   zone = "Terrapin Ocean",  x = 8,    y = 56,  z = 1861,
+	  mode = "shore", sx = 25,    sy = 152, sz = 1871  },
+	{ name = "Forsaken Shores",   zone = "Forsaken Shores", x = -2420, y = 114, z = 1440,
+	  mode = "shore", sx = -2400, sy = 147, sz = 1440  },
+	{ name = "Lost Jungle",       zone = "Lost Jungle",     x = -2521, y = 127, z = -2092,
+	  mode = "shore", sx = -2504, sy = 172, sz = -2082 },
+	{ name = "The Arch",          zone = "The Arch",        x = 1055, y = 108, z = -1191,
+	  mode = "shore", sx = 1045,  sy = 298, sz = -1208 },
+	{ name = "Castaway Cliffs",   zone = "Castaway Cliffs", x = 601,  y = 145, z = -1859,
+	  mode = "shore", sx = 621,   sy = 139, sz = -1859 },
+}
+
+local DEEP_SPOTS = {
+	{ name = "Scallop Ocean",     zone = "Scallop Ocean",    x = 23,   y = 99,   z = 739,
+	  mode = "water", wy = 103 },
+	{ name = "Deep Ocean",        zone = "Deep Ocean",       x = 1978, y = 40,   z = 1150,
+	  mode = "water", wy = 102 },
+	{ name = "Grand Reef",        zone = "Grand Reef",       x = -3577, y = 12,  z = 542,
+	  mode = "water", wy = 153 },
+	{ name = "Atlantis",          zone = "Atlantean Storm",  x = -3496, y = 12,  z = 314,
+	  mode = "water", wy = 102 },
+	{ name = "Desolate Deep",     zone = "Desolate Deep",    x = -1561, y = -291, z = -2825,
+	  mode = "water", wy = 102 },
+	{ name = "Living Garden",     zone = "Living Garden",    x = -2443, y = -306, z = -2904,
+	  mode = "water", wy = 99 },
+	{ name = "Toxic Grove",       zone = "Toxic Grove",      x = -2564, y = -329, z = -2238,
+	  mode = "water", wy = 161 },
+	{ name = "Vertigo",           zone = "Vertigo",          x = -71,  y = -749, z = 1204,
+	  mode = "water", wy = 102 },
+	{ name = "The Depths",        zone = "The Depths",       x = 841,  y = -770, z = 1246,
+	  mode = "water", wy = 102 },
+	{ name = "Enchanted Crevice", zone = "Enchanted Crevice", x = 775, y = -778, z = -437,
+	  mode = "water", wy = 100 },
+	--  the surface of these two is not survivable: standing in it costs health
+	--  and, at Keepers Altar, everything. They land on the nearest shore.
+	{ name = "Mineshaft",         zone = "Mineshaft",        x = -685, y = -871, z = -110,
+	  mode = "shore", sx = -485,  sy = 159, sz = -456 },
+	{ name = "Keepers Altar",     zone = "Keepers Altar",    x = 1330, y = -881, z = -129,
+	  mode = "shore", sx = 637,   sy = 161, sz = 271  },
+}
+
+-- one flat lookup so the console API can take a plain name
+local SPOT_BY_NAME = {}
+for _, list in ipairs({ ISLANDS, DEEP_SPOTS }) do
+	for _, e in ipairs(list) do SPOT_BY_NAME[e.name] = e end
+end
+
+local SPOT_FILE = "spots.json"
+
+--  { ["Roslit Bay"] = { x = .., y = .., z = .. }, ... }
+local learned = {}
+
+local function loadSpots()
+	learned = {}
+	if type(readfile) ~= "function" then return end
+	local ok, raw = pcall(readfile, CFG_FOLDER .. "/" .. SPOT_FILE)
+	if not ok or type(raw) ~= "string" or raw == "" then return end
+	local ok2, rows = pcall(function() return HttpService:JSONDecode(raw) end)
+	if not ok2 or type(rows) ~= "table" then return end
+	for _, row in ipairs(rows) do
+		if type(row) == "table" and type(row.n) == "string"
+			and type(row.x) == "number" and type(row.y) == "number" and type(row.z) == "number" then
+			learned[row.n] = { x = row.x, y = row.y, z = row.z }
+		end
+	end
+	logf("spots loaded: %d", #rows)
+end
+
+local function saveSpots()
+	if type(writefile) ~= "function" then return end
+	local rows = {}
+	for name, p in pairs(learned) do
+		rows[#rows + 1] = { n = name, x = p.x, y = p.y, z = p.z }
+	end
+	table.sort(rows, function(a, b) return a.n < b.n end)
+	local ok, json = pcall(function() return HttpService:JSONEncode(rows) end)
+	if not ok then return end
+	if type(isfolder) == "function" and not isfolder(CFG_FOLDER) then
+		pcall(makefolder, CFG_FOLDER)
+	end
+	pcall(writefile, CFG_FOLDER .. "/" .. SPOT_FILE, json)
+end
+
+local function here()
+	local char = LocalPlayer and LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	return root and root.Position or nil
+end
+
+local function firstPart(root)
+	if not root then return nil end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then return d end
+	end
+	return nil
+end
+
+--  Zones are trigger volumes and the sea volumes are not solid, so both are
+--  switched off: a ray may only ever report real ground, otherwise it lands on
+--  a zone box at y = 547 or on a palm leaf and the character is put on a roof.
+local ZONES = workspace:FindFirstChild("zones")
+
+local RAY = RaycastParams.new()
+RAY.FilterType = Enum.RaycastFilterType.Exclude
+RAY.IgnoreWater = true
+
+local function castFrom(origin, dir)
+	RAY.FilterDescendantsInstances = { ZONES, workspace.CurrentCamera }
+	return workspace:Raycast(origin, dir, RAY)
+end
+
+--  Height of the first solid surface under a point, or nil over open water
+local function groundY(x, z)
+	local hit = castFrom(Vector3.new(x, 600, z), Vector3.new(0, -2000, 0))
+	if not hit then return nil end
+	local p = hit.Instance
+	if not p:IsA("BasePart") or not p.CanCollide then return nil end
+	return hit.Position.Y
+end
+
+--  Good enough to stand on: mostly the same height, and nothing overhead
+local function standable(x, y, z)
+	local n = 0
+	for _, dx in ipairs({ 0, 6, -6 }) do
+		for _, dz in ipairs({ 0, 6, -6 }) do
+			local h = groundY(x + dx, z + dz)
+			if h and math.abs(h - y) < 7 then n = n + 1 end
+		end
+	end
+	if n < 6 then return false end
+	return castFrom(Vector3.new(x, y + 3, z), Vector3.new(0, 14, 0)) == nil
+end
+
+--  Walks outwards in rings and takes the first patch of ground worth standing
+--  on. Only reached when a measured point turns out to be unusable, so the
+--  cost of a few thousand rays does not matter.
+local LAND_RINGS = { 0, 20, 40, 60, 90, 120, 160, 200, 260, 320, 400, 500, 650, 800, 1000 }
+
+local function findLanding(cx, cz)
+	for _, r in ipairs(LAND_RINGS) do
+		local steps = (r == 0) and 1 or 12
+		for i = 0, steps - 1 do
+			local a = (i / steps) * math.pi * 2
+			local x = cx + math.cos(a) * r
+			local z = cz + math.sin(a) * r
+			local y = groundY(x, z)
+			if y and y > (WATER_Y - 40) and standable(x, y, z) then
+				logf("landing point found at %d,%d,%d (ring %d)", x, y, z, r)
+				return Vector3.new(x, y + 4, z)
+			end
+		end
+	end
+	return nil
+end
+
+--  Looked up in the live world, for the islands that are in no table
+local function liveSpot(e)
+	local world = workspace:FindFirstChild("world")
+	if world then
+		--  the island's own spawn or quest folder, when the game has streamed it in
+		local spawns = world:FindFirstChild("spawns")
+		local part = firstPart(spawns and spawns:FindFirstChild(e.name))
+			or firstPart(Controllers:FindFirstChild("Locations")
+				and Controllers.Locations:FindFirstChild(e.name))
+		if part then
+			logf("live spot for %s from %s", e.name, part:GetFullName())
+			return part.Position
+		end
+
+		--  the middle of whatever geometry of the island is loaded right now
+		local map = world:FindFirstChild("map")
+		map = map and map:FindFirstChild(e.name)
+		if map then
+			local n, sx, sz = 0, 0, 0
+			for _, c in ipairs(map:GetDescendants()) do
+				if c:IsA("BasePart") and (c.Position.Y + c.Size.Y / 2) > (WATER_Y + 2) then
+					n = n + 1
+					sx = sx + c.Position.X
+					sz = sz + c.Position.Z
+				end
+			end
+			if n >= 4 then
+				logf("live spot for %s from %d loaded parts", e.name, n)
+				return Vector3.new(sx / n, WATER_Y + 6, sz / n)
+			end
+		end
+	end
+
+	--  finally a fishing volume that carries the island's name
+	local zones = workspace:FindFirstChild("zones")
+	zones = zones and zones:FindFirstChild("fishing")
+	if zones then
+		for _, c in ipairs(zones:GetChildren()) do
+			if c:IsA("BasePart") and c.Name == e.zone then return c.Position end
+		end
+	end
+	return nil
+end
+
+--  The point the character is actually put down on
+local function standFor(e)
+	--  measured ground, or the surface above a volume with no shore
+	if e.sx then
+		return Vector3.new(e.sx, e.sy + 4, e.sz)
+	end
+	if e.mode == "water" then
+		return Vector3.new(e.x, (e.wy or WATER_Y) + 6, e.z)
+	end
+
+	--  nowhere in the tables: the file first, then the running world
+	local saved = learned[e.name]
+	if saved then return Vector3.new(saved.x, saved.y, saved.z) end
+	return liveSpot(e)
+end
+
+local function rememberSpot(name, v)
+	learned[name] = { x = v.X, y = v.Y, z = v.Z }
+end
+
+--  Two and a half seconds of tidying up after a jump, fixing the two ways a
+--  PivotTo can go wrong. Standing on real ground the first branch does nothing,
+--  because the ground under the feet is already below the character:
+--    inside a hillside - the ray finds ground above the feet, so the character
+--      is put on top of that surface rather than in the middle of it
+--    sinking in open water - there is nothing at all underfoot, so the character
+--      is put back on the surface it arrived at
+local function settle()
+	local char = LocalPlayer and LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local top = root.Position.Y
+	for _ = 1, 25 do
+		task.wait(0.1)
+		local live = LocalPlayer and LocalPlayer.Character
+		if not root.Parent or not live
+			or root ~= live:FindFirstChild("HumanoidRootPart") then return end
+
+		local p = root.Position
+		if p.Y > top then top = p.Y end
+
+		local y = groundY(p.X, p.Z)
+		local want
+		if y and y > (p.Y + 1) then
+			want = CFrame.new(p.X, y + 4, p.Z)
+		elseif not y and Config.TpFloat and p.Y < (top - 12) then
+			want = CFrame.new(p.X, top, p.Z)
+		end
+
+		if want and (root.CFrame.Position - want.Position).Magnitude > 2 then
+			char:PivotTo(want)
+			root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			top = want.Position.Y
+		end
+	end
+end
+
+--  Holds the character on the surface while they are over deep water, so a dive
+--  that was not asked for never ends with the oxygen running out. Off, if a dive
+--  is exactly what is wanted.
+local function floatLoop()
+	while S.unlocked do
+		if Config.TpFloat and (S.floatTop or 0) > 0 then
+			local char = LocalPlayer and LocalPlayer.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if root then
+				local p = root.Position
+				if p.Y < (S.floatTop - 15) and not groundY(p.X, p.Z) then
+					char:PivotTo(CFrame.new(p.X, S.floatTop, p.Z))
+					root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					logf("floated back to the surface at y=%.0f", S.floatTop)
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+end
+
+--  Moves the character and reports what happened, so a button can say it out loud
+local function travelTo(name)
+	local e = SPOT_BY_NAME[name]
+	if not e then return false, "There is no place called \"" .. tostring(name) .. "\"" end
+
+	local char = LocalPlayer and LocalPlayer.Character
+	if not char then return false, "No character yet" end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false, "The character is dead" end
+
+	local stand = standFor(e)
+	if not stand then
+		return false, "No spot data for " .. name .. " - visit the island once and it is remembered"
+	end
+
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return false, "No HumanoidRootPart" end
+
+	char:PivotTo(CFrame.new(stand.X, stand.Y, stand.Z))
+	--  the old velocity would slide the character straight back off
+	root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	if root:IsA("BasePart") then
+		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end
+
+	--  only a water destination arms the float: on land the ray finds ground
+	--  and the loop has nothing to do
+	S.floatTop = (e.mode == "water") and stand.Y or 0
+
+	rememberSpot(e.name, stand)
+	saveSpots()
+	task.spawn(settle)
+	setStatus("Travelling", name)
+	logf("teleport %s -> %.0f,%.0f,%.0f (%s)", e.name, stand.X, stand.Y, stand.Z, e.mode)
+	return true, name
+end
+
+--  One honest line per button
+local function descFor(e)
+	if e.mode == "water" then
+		return string.format("No shore in casting range, so you float on the surface "
+			.. "above a volume %d below it", math.abs(e.y - (e.wy or WATER_Y)))
+	end
+	if e.sx then
+		local d = math.sqrt((e.sx - e.x) ^ 2 + (e.sz - e.z) ^ 2)
+		if d > 250 then
+			return string.format("The water above this volume is not survivable, so you are "
+				.. "put down on the nearest shore, %d studs away", math.floor(d))
+		end
+		return "Shore of " .. e.name .. " - you are put down on solid ground"
+	end
+	return "Where you were standing when you visited " .. e.name
+end
+
+--------------------------------------------------------------------------------
 --  MAIN LOOP
 --------------------------------------------------------------------------------
 
@@ -1036,16 +1438,13 @@ end
 --  SETTINGS FILE
 --------------------------------------------------------------------------------
 
-local CFG_FOLDER = "AutoFish"
-local CFG_FILE   = "autofish.cfg.json"
-
 local function saveConfig()
 	if type(writefile) ~= "function" then return end
 	local payload = {}
 	for k, v in pairs(Config) do
 		if type(v) ~= "function" then payload[k] = v end
 	end
-	local ok, json = pcall(HttpService.JSONEncode, payload)
+	local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
 	if not ok then return end
 	if type(isfolder) == "function" and not isfolder(CFG_FOLDER) then
 		pcall(makefolder, CFG_FOLDER)
@@ -1058,7 +1457,7 @@ local function loadConfig()
 	if type(readfile) ~= "function" then return end
 	local ok, raw = pcall(readfile, CFG_FOLDER .. "/" .. CFG_FILE)
 	if not ok or type(raw) ~= "string" or raw == "" then return end
-	local ok2, data = pcall(HttpService.JSONDecode, raw)
+	local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
 	if not ok2 or type(data) ~= "table" then return end
 	for k, v in pairs(data) do
 		if Config[k] ~= nil and type(v) == type(Config[k]) then
@@ -1763,9 +2162,10 @@ local function buildUI()
 	sfxLoad()
 
 	-- everything lives in one tab now: fishing, minigames and farming
-	local farmT, themeT, optT
+	local farmT, tpT, themeT, optT
 
 	pcall(function() farmT  = window:Tab({ Title = "Farming" }) end)
+	pcall(function() tpT    = window:Tab({ Title = "Teleports" }) end)
 	pcall(function() themeT = window:Tab({ Title = "Theme" }) end)
 	pcall(function() optT   = window:Tab({ Title = "Settings" }) end)
 
@@ -2044,6 +2444,107 @@ local function buildUI()
 		Value    = Config.Bait,
 		Values   = S.baits,
 		Callback = function(v) Config.Bait = v; S.baitAt = 0 end,
+	})
+
+	--------------------------------------------------------------------------
+	--  Teleports
+	--------------------------------------------------------------------------
+	markHint(add(tpT, "Paragraph", {
+		Title = "Locked",
+		Desc  = "The access key has not been entered yet. Paste it in the first section of the Farming tab.",
+	}))
+
+	local sHome = add(tpT, "Section", {
+		Title = "Home point",
+		Desc  = "Where you were standing when the script started. Use it to come back from a trip",
+	})
+	add(sHome, "Button", {
+		Title = "Go home",
+		Desc  = "Teleports back to the spot the script was started on",
+		Callback = function()
+			local p = S.home or here()
+			if not p then
+				notify("Xivid Hub", "Nowhere to go back to", "Error")
+				return
+			end
+			local char = LocalPlayer and LocalPlayer.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if not root then
+				notify("Xivid Hub", "No character yet", "Error")
+				return
+			end
+			char:PivotTo(CFrame.new(p.X, p.Y + 3, p.Z))
+			root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			task.spawn(settle)
+			notify("Xivid Hub", "Back at the home point", "Success")
+		end,
+	})
+	add(sHome, "Button", {
+		Title = "Set home here",
+		Desc  = "Overwrites the home point with the position you are standing in right now",
+		Callback = function()
+			local p = here()
+			if not p then
+				notify("Xivid Hub", "No character yet", "Error")
+				return
+			end
+			S.home = p
+			notify("Xivid Hub", "Home point set", "Success")
+		end,
+	})
+
+	add(sHome, "Toggle", {
+		Title = "Surface guard", Value = Config.TpFloat,
+		Desc  = "Over deep water, keeps you on the surface instead of sinking, "
+			.. "so the oxygen never runs out. Turn it off if you want to dive on purpose",
+		Callback = function(v) Config.TpFloat = v end,
+	})
+
+	add(tpT, "Paragraph", {
+		Title = "How the travel works",
+		Desc  = "The game keeps its own fast travel shut for scripts, so this tab moves the "
+			.. "character directly. You are put down on ground that was measured with a ray and "
+			.. "checked for being flat and for having a head above it, never on a guessed sea "
+			.. "level - the sea is at y = 102 off Moosewood and at y = 153 over the Grand Reef, "
+			.. "and guessing drops you under the surface. Deep places float on the surface "
+			.. "above the volume. Every place you visit is remembered for next time.",
+	})
+	add(tpT, "Divider", {})
+
+	local sIslands = add(tpT, "Section", {
+		Title = "Islands",
+		Desc  = "Sea 1 and the surrounding water. Every one of these lands on solid ground",
+	})
+	for _, e in ipairs(ISLANDS) do
+		add(sIslands, "Button", {
+			Title = e.name,
+			Desc  = descFor(e),
+			Callback = function()
+				local ok, msg = travelTo(e.name)
+				notify("Xivid Hub", ok and ("Travelling to " .. msg) or msg, ok and "Success" or "Error")
+			end,
+		})
+	end
+
+	local sDeep = add(tpT, "Section", {
+		Title = "Deep water",
+		Desc  = "These volumes sit far under the surface. Where no shore is in casting range "
+			.. "you are set on top of the water and held there by the surface guard",
+	})
+	for _, e in ipairs(DEEP_SPOTS) do
+		add(sDeep, "Button", {
+			Title = e.name,
+			Desc  = descFor(e),
+			Callback = function()
+				local ok, msg = travelTo(e.name)
+				notify("Xivid Hub", ok and ("Travelling to " .. msg) or msg, ok and "Success" or "Error")
+			end,
+		})
+	end
+
+	add(tpT, "Paragraph", {
+		Title = "Console",
+		Desc  = "From the executor console:  _G.__AutoFish.Teleport(\"Roslit Bay\")",
 	})
 
 	--------------------------------------------------------------------------
@@ -2327,12 +2828,17 @@ local function start()
 	end
 
 	loadConfig()
+	loadSpots()
 	sanitizeStyle()
+	-- the "Go home" button needs a starting point to come back to
+	S.home = here()
+	S.floatTop = 0
 	assistHook()
 	-- if a reel is already running, install auto lock right away
 	pcall(assistInstall, ReelController.ActiveReel)
 	bindKeys()
 	keep(RunService.Heartbeat:Connect(tick))
+	task.spawn(floatLoop)
 	-- the menu is built separately: assembling WindUI takes a couple of
 	-- seconds and the clipboard has to be filled immediately
 	task.spawn(buildUI)
@@ -2374,6 +2880,28 @@ local function start()
 			tryUnlock(typed)
 		end,
 		Invite   = function() return copyInvite(false) end,
+		-- island travel
+		Teleport = function(name)
+			if not S.unlocked then
+				notify("Xivid Hub", "Enter the access key first", "Error")
+				return false
+			end
+			local ok, msg = travelTo(name)
+			notify("Xivid Hub", ok and ("Travelling to " .. msg) or msg, ok and "Success" or "Error")
+			return ok
+		end,
+		Spots    = function()
+			local out, seen = {}, {}
+			for name in pairs(SPOT_BY_NAME) do
+				seen[name] = true
+				out[#out + 1] = name
+			end
+			for name in pairs(learned) do
+				if not seen[name] then out[#out + 1] = name end
+			end
+			table.sort(out)
+			return table.concat(out, ", ")
+		end,
 		Save    = saveConfig,
 		Load    = loadConfig,
 		Reset   = resetConfig,
